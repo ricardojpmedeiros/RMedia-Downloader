@@ -416,35 +416,251 @@ async function startServer() {
     }
   });
 
-  // YouTube Search API route using yt-search
+  // Helper to scrape search results using fetch with cookies fallback
+  const searchScraper = async (query: string, cookiesInput?: string) => {
+    const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAQ%253D%253D`;
+    const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
+    const headers: Record<string, string> = {
+      "User-Agent": randomUA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1"
+    };
+
+    const cookieSource = cookiesInput || globalCookiesInput;
+    if (cookieSource) {
+      const cookiesArray = parseCookies(cookieSource);
+      if (cookiesArray.length > 0) {
+        const cookieHeader = cookiesArray.map(c => `${c.name}=${c.value}`).join("; ");
+        headers["Cookie"] = cookieHeader;
+      }
+    }
+
+    const response = await fetch(searchUrl, { headers });
+    if (!response.ok) {
+      throw new Error(`YouTube returned status ${response.status} when searching.`);
+    }
+
+    const html = await response.text();
+
+    // Parse out ytInitialData
+    let jsonStr = "";
+    const startToken = "ytInitialData = ";
+    const startIndex = html.indexOf(startToken);
+    if (startIndex !== -1) {
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      let endIndex = -1;
+      const startJson = startIndex + startToken.length;
+      for (let i = startJson; i < html.length; i++) {
+        const char = html[i];
+        if (escape) {
+          escape = false;
+          continue;
+        }
+        if (char === "\\") {
+          escape = true;
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          inString = !inString;
+          continue;
+        }
+        if (!inString) {
+          if (char === "{") {
+            depth++;
+          } else if (char === "}") {
+            depth--;
+            if (depth === 0) {
+              endIndex = i;
+              break;
+            }
+          }
+        }
+      }
+      if (endIndex !== -1) {
+        jsonStr = html.substring(startJson, endIndex + 1);
+      }
+    }
+
+    if (!jsonStr) {
+      // Fallback: try simple regex match
+      const match = html.match(/var ytInitialData\s*=\s*({.*?});/s) || html.match(/ytInitialData\s*=\s*({.*?});/s);
+      if (match) {
+        jsonStr = match[1];
+      }
+    }
+
+    if (!jsonStr) {
+      throw new Error("Não foi possível extrair os dados da página de resultados.");
+    }
+
+    if (jsonStr.endsWith(";")) {
+      jsonStr = jsonStr.slice(0, -1);
+    }
+
+    const data = JSON.parse(jsonStr);
+    const renderers: any[] = [];
+    
+    const findVideoRenderers = (obj: any) => {
+      if (!obj || typeof obj !== "object") return;
+      if (obj.videoRenderer) {
+        renderers.push(obj.videoRenderer);
+      }
+      for (const key of Object.keys(obj)) {
+        findVideoRenderers(obj[key]);
+      }
+    };
+
+    findVideoRenderers(data);
+
+    if (renderers.length === 0) {
+      return [];
+    }
+
+    return renderers.map((renderer: any) => {
+      const id = renderer.videoId;
+      if (!id) return null;
+
+      const url = `https://www.youtube.com/watch?v=${id}`;
+      
+      let title = "";
+      if (renderer.title && Array.isArray(renderer.title.runs)) {
+        title = renderer.title.runs.map((r: any) => r.text).join("");
+      } else if (renderer.title && renderer.title.simpleText) {
+        title = renderer.title.simpleText;
+      }
+
+      let authorName = "Desconhecido";
+      let authorUrl = "";
+      const byline = renderer.ownerText || renderer.longBylineText || renderer.shortBylineText;
+      if (byline && Array.isArray(byline.runs) && byline.runs.length > 0) {
+        authorName = byline.runs[0].text;
+        const path = byline.runs[0].navigationEndpoint?.browseEndpoint?.canonicalBaseUrl || byline.runs[0].navigationEndpoint?.commandMetadata?.webCommandMetadata?.url;
+        if (path) {
+          authorUrl = `https://www.youtube.com${path}`;
+        }
+      }
+
+      const duration = renderer.lengthText?.simpleText || "";
+      let seconds = 0;
+      if (duration) {
+        const parts = duration.split(":").map(Number);
+        if (parts.length === 2) {
+          seconds = parts[0] * 60 + parts[1];
+        } else if (parts.length === 3) {
+          seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        }
+      }
+
+      let thumbnail = "";
+      if (renderer.thumbnail && Array.isArray(renderer.thumbnail.thumbnails) && renderer.thumbnail.thumbnails.length > 0) {
+        thumbnail = renderer.thumbnail.thumbnails[renderer.thumbnail.thumbnails.length - 1].url;
+      } else {
+        thumbnail = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+      }
+
+      let viewsText = "";
+      if (renderer.viewCountText && renderer.viewCountText.simpleText) {
+        viewsText = renderer.viewCountText.simpleText;
+      } else if (renderer.shortViewCountText && renderer.shortViewCountText.simpleText) {
+        viewsText = renderer.shortViewCountText.simpleText;
+      }
+      
+      let views = 0;
+      if (viewsText) {
+        const cleanViews = viewsText.replace(/[^\d]/g, "");
+        if (cleanViews) {
+          views = parseInt(cleanViews, 10);
+        }
+      }
+
+      let description = "";
+      if (renderer.detailedMetadataSnippets && renderer.detailedMetadataSnippets.length > 0) {
+        const snippet = renderer.detailedMetadataSnippets[0];
+        if (snippet.snippetText && Array.isArray(snippet.snippetText.runs)) {
+          description = snippet.snippetText.runs.map((r: any) => r.text).join("");
+        }
+      }
+
+      const uploadedAt = renderer.publishedTimeText?.simpleText || "";
+
+      return {
+        id,
+        videoId: id,
+        url,
+        title,
+        description,
+        duration,
+        timestamp: duration,
+        seconds,
+        views,
+        uploadedAt,
+        ago: uploadedAt,
+        author: {
+          name: authorName,
+          url: authorUrl
+        },
+        thumbnail,
+        image: thumbnail
+      };
+    }).filter(Boolean);
+  };
+
+  // YouTube Search API route featuring a custom scraper with yt-search fallback
   app.get("/api/search", async (req, res) => {
     const query = req.query.q as string;
+    const cookiesInput = req.query.cookies as string;
     if (!query || !query.trim()) {
       return res.status(400).json({ error: "Termo de busca vazio." });
     }
 
     try {
-      console.log(`Buscando no YouTube por: "${query}"`);
-      const results = await ytSearch(query);
-      const videos = (results.videos || []).slice(0, 15).map((v: any) => ({
-        id: v.videoId,
-        url: v.url,
-        title: v.title,
-        description: v.description,
-        duration: v.timestamp,
-        seconds: v.seconds,
-        views: v.views,
-        uploadedAt: v.ago,
-        author: {
-          name: v.author?.name || "Desconhecido",
-          url: v.author?.url || ""
-        },
-        thumbnail: v.thumbnail || v.image
-      }));
-      res.json({ videos });
-    } catch (error: any) {
-      console.error("Erro na busca do YouTube:", error);
-      res.status(500).json({ error: "Erro ao realizar busca no YouTube. Tente novamente." });
+      console.log(`[Search] Buscando no YouTube via Scraper por: "${query}"`);
+      const scrapedVideos = await searchScraper(query, cookiesInput);
+      if (scrapedVideos && scrapedVideos.length > 0) {
+        console.log(`[Search] Scraper retornou ${scrapedVideos.length} resultados.`);
+        return res.json({ videos: scrapedVideos.slice(0, 15) });
+      }
+      throw new Error("Scraper retornou lista vazia de resultados.");
+    } catch (scraperError: any) {
+      console.warn("[Search] Scraper falhou, tentando yt-search como fallback...", scraperError.message || scraperError);
+      
+      try {
+        console.log(`[Search] Buscando no YouTube via yt-search por: "${query}"`);
+        const results = await ytSearch(query);
+        const videos = (results.videos || []).slice(0, 15).map((v: any) => ({
+          id: v.videoId || v.id,
+          videoId: v.videoId || v.id,
+          url: v.url,
+          title: v.title,
+          description: v.description,
+          duration: v.timestamp || v.duration,
+          timestamp: v.timestamp || v.duration,
+          seconds: v.seconds,
+          views: v.views,
+          uploadedAt: v.ago || v.uploadedAt,
+          ago: v.ago || v.uploadedAt,
+          author: {
+            name: v.author?.name || "Desconhecido",
+            url: v.author?.url || ""
+          },
+          thumbnail: v.thumbnail || v.image,
+          image: v.thumbnail || v.image
+        }));
+        return res.json({ videos });
+      } catch (fallbackError: any) {
+        console.error("[Search] Todos os métodos de busca falharam:", fallbackError);
+        return res.status(500).json({ error: "Erro ao realizar busca no YouTube. Tente configurar ou atualizar os cookies nas configurações se o problema persistir." });
+      }
     }
   });
 

@@ -158,7 +158,7 @@ export default function App() {
     }
 
     try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
+      const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&cookies=${encodeURIComponent(cookies)}`);
       const data = await response.json();
       if (response.ok) {
         setSearchResults(data.videos || []);
